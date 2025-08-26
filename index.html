@@ -2,79 +2,171 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>SPIKE Manual B,E,F</title>
+  <title>SPIKE Debug & Manual Control (B,E,F)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <style>body{font-family:Arial;padding:12px} button{padding:10px;margin:6px}</style>
+  <style>
+    body{font-family:Arial;padding:14px;max-width:900px;margin:auto}
+    pre{background:#f4f4f4;padding:8px;border-radius:6px;overflow:auto}
+    button{padding:8px 10px;margin:6px}
+    .ok{color:green} .err{color:red}
+    .section{border:1px solid #eee;padding:10px;border-radius:8px;margin-top:12px}
+  </style>
 </head>
 <body>
-  <h3>تحكم يدوي — المحركات B, E, F</h3>
-  <button id="connect">اتصال بالـHub</button>
-  <div id="status">غير متصل</div>
+  <h2>SPIKE Debug & Manual Control — B, E, F</h2>
+  <p>اتبع: أطفئ تطبيق LEGO الرسمي → أعد تشغيل الـHub → ثم اضغط Connect.</p>
 
-  <div style="margin-top:12px">
-    <div><strong>B (portId=1)</strong>
-      <button onclick="sendStart(1,80)">تشغيل B 80%</button>
-      <button onclick="sendCoast(1)">Coast</button>
-      <button onclick="sendBrake(1)">Brake</button>
+  <div class="section">
+    <button id="connectBtn">Connect and inspect device</button>
+    <span id="status" class="err">Not connected</span>
+    <div id="info"></div>
+  </div>
+
+  <div class="section">
+    <h3>Manual controls (B=1, E=4, F=5)</h3>
+    <div id="controls">
+      <div><strong>B (portId=1)</strong>
+        <button onclick="startPort(1,80)">Start B 80%</button>
+        <button onclick="coastPort(1)">Coast B</button>
+        <button onclick="brakePort(1)">Brake B</button>
+      </div>
+      <div><strong>E (portId=4)</strong>
+        <button onclick="startPort(4,80)">Start E 80%</button>
+        <button onclick="coastPort(4)">Coast E</button>
+        <button onclick="brakePort(4)">Brake E</button>
+      </div>
+      <div><strong>F (portId=5)</strong>
+        <button onclick="startPort(5,80)">Start F 80%</button>
+        <button onclick="coastPort(5)">Coast F</button>
+        <button onclick="brakePort(5)">Brake F</button>
+      </div>
     </div>
-    <div><strong>E (portId=4)</strong>
-      <button onclick="sendStart(4,80)">تشغيل E 80%</button>
-      <button onclick="sendCoast(4)">Coast</button>
-      <button onclick="sendBrake(4)">Brake</button>
-    </div>
-    <div><strong>F (portId=5)</strong>
-      <button onclick="sendStart(5,80)">تشغيل F 80%</button>
-      <button onclick="sendCoast(5)">Coast</button>
-      <button onclick="sendBrake(5)">Brake</button>
-    </div>
+    <div id="manualStatus"></div>
+  </div>
+
+  <div class="section">
+    <h3>Diagnostic output (services & characteristics)</h3>
+    <div id="diag"></div>
   </div>
 
 <script>
-  const LWP3_SERVICE = '00001623-1212-efde-1623-785feabcd123';
-  const LWP3_CHAR    = '00001624-1212-efde-1623-785feabcd123';
-  let char = null;
+const diagEl = document.getElementById('diag');
+const infoEl = document.getElementById('info');
+const statusEl = document.getElementById('status');
+const manualStatus = document.getElementById('manualStatus');
 
-  async function connectHub(){
-    document.getElementById('status').textContent = 'جاري الاتصال...';
-    try{
-      const device = await navigator.bluetooth.requestDevice({
-        acceptAllDevices: true,
-        optionalServices: [LWP3_SERVICE]
-      });
-      const server = await device.gatt.connect();
-      const service = await server.getPrimaryService(LWP3_SERVICE);
-      char = await service.getCharacteristic(LWP3_CHAR);
-      document.getElementById('status').textContent = 'متصل';
-    }catch(e){
-      document.getElementById('status').textContent = 'فشل الاتصال: ' + (e.message || e);
-      console.error(e);
+let g_device = null;
+let g_server = null;
+let g_char = null; // characteristic chosen for writing (auto-detected)
+
+function logDiag(txt){ diagEl.innerHTML += '<pre>'+txt+'</pre>'; }
+function setInfo(txt, ok=false){ infoEl.innerHTML = '<div class="'+(ok?'ok':'err')+'">'+txt+'</div>'; }
+function setStatus(txt, ok=false){ statusEl.textContent = txt; statusEl.className = ok? 'ok':'err'; }
+function setManual(txt){ manualStatus.innerHTML = '<pre>'+txt+'</pre>'; }
+
+// Convert props object to readable
+function propsToStr(p){
+  let arr = [];
+  for (const k in p) if (p[k]) arr.push(k);
+  return arr.join(',');
+}
+
+// Connect -> list services -> auto-detect writable characteristic
+document.getElementById('connectBtn').addEventListener('click', async () => {
+  diagEl.innerHTML = ''; infoEl.innerHTML=''; setManual(''); setStatus('...connecting', false);
+  try {
+    // request any device, to be safe accept all devices (user picks the Hub)
+    g_device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: [] // keep empty so we can discover all using getPrimaryServices()
+    });
+
+    setStatus('Device selected: ' + (g_device.name || g_device.id), true);
+
+    g_device.addEventListener('gattserverdisconnected', () => {
+      setStatus('Disconnected', false);
+      logDiag('Device disconnected.');
+    });
+
+    g_server = await g_device.gatt.connect();
+    setStatus('GATT connected', true);
+
+    // list services
+    const services = await g_server.getPrimaryServices();
+    logDiag('Found ' + services.length + ' primary services.');
+    let foundWritable = null;
+
+    for (const s of services) {
+      logDiag('Service UUID: ' + s.uuid);
+      try {
+        const chars = await s.getCharacteristics();
+        logDiag(' Characteristics: ' + chars.length);
+        for (const c of chars) {
+          logDiag('  - ' + c.uuid + ' [' + propsToStr(c.properties) + ']');
+          // pick first char that supports writeWithoutResponse or write
+          if (!foundWritable && (c.properties.write || c.properties.writeWithoutResponse)) {
+            foundWritable = {service: s.uuid, char: c.uuid, props: propsToStr(c.properties)};
+          }
+        }
+      } catch(e){
+        logDiag('  ! error reading characteristics of service ' + s.uuid + ' : ' + e);
+      }
     }
-  }
 
-  async function sendStart(portId, speed){
-    if (!char) { alert('اتصل أولاً'); return; }
-    // StartSpeed message length=9
-    const s = ((speed + 256) & 0xFF); // signed int8 -> byte
-    const bytes = new Uint8Array([0x09,0x00,0x81,portId & 0xFF,0x11,0x07, s, 100, 0x00]);
-    await char.writeValue(bytes);
-    console.log('start',portId,bytes);
-  }
+    if (foundWritable) {
+      setInfo('Found writable characteristic: ' + foundWritable.char + ' (service ' + foundWritable.service + ')', true);
+      // get that characteristic object and save it
+      const svc = await g_server.getPrimaryService(foundWritable.service);
+      g_char = await svc.getCharacteristic(foundWritable.char);
+      logDiag('Writable characteristic handle stored for manual commands.');
+    } else {
+      setInfo('لم أجد أي خاصية قابلة للكتابة (write) تلقائياً.', false);
+    }
 
-  async function sendCoast(portId){
-    if (!char) { alert('اتصل أولاً'); return; }
-    const bytes = new Uint8Array([0x08,0x00,0x81,portId & 0xFF,0x11,0x51,0x00,0x00]);
-    await char.writeValue(bytes);
-    console.log('coast',portId);
+  } catch (err) {
+    console.error(err);
+    setStatus('Connection failed', false);
+    logDiag('ERROR: ' + (err.message || err));
+    setInfo('فشل الاتصال: ' + (err.message || err), false);
   }
+});
 
-  async function sendBrake(portId){
-    if (!char) { alert('اتصل أولاً'); return; }
-    const bytes = new Uint8Array([0x08,0x00,0x81,portId & 0xFF,0x11,0x51,0x00,0x7F]);
-    await char.writeValue(bytes);
-    console.log('brake',portId);
+// helper to write bytes and show result
+async function writeBytes(bytes){
+  if (!g_char) {
+    setManual('No writable characteristic selected. See diagnostic output above.');
+    return;
   }
+  try {
+    await g_char.writeValue(bytes);
+    setManual('Wrote bytes: ' + Array.from(bytes).map(b=>('0x'+b.toString(16).padStart(2,'0'))).join(' '));
+  } catch(e){
+    console.error(e);
+    setManual('Write error: ' + (e.message || e));
+  }
+}
 
-  document.getElementById('connect').addEventListener('click', connectHub);
+// Port helpers (B=1,E=4,F=5)
+function int8ToByte(v){ return (v & 0xFF); }
+async function startPort(portId, speedPercent){
+  // StartSpeed: length=9, 0x00, 0x81, port, 0x11, 0x07, speed(int8), maxPower(uint8), useProfile(uint8)
+  const s = Math.max(-100, Math.min(100, Math.round(speedPercent)));
+  const b = new Uint8Array([0x09,0x00,0x81, portId & 0xFF, 0x11, 0x07, int8ToByte(s), 100, 0x00]);
+  await writeBytes(b);
+}
+async function coastPort(portId){
+  const b = new Uint8Array([0x08,0x00,0x81, portId & 0xFF, 0x11, 0x51, 0x00, 0x00]);
+  await writeBytes(b);
+}
+async function brakePort(portId){
+  const b = new Uint8Array([0x08,0x00,0x81, portId & 0xFF, 0x11, 0x51, 0x00, 0x7F]);
+  await writeBytes(b);
+}
+
+// Expose to buttons
+window.startPort = startPort;
+window.coastPort = coastPort;
+window.brakePort = brakePort;
 </script>
 </body>
 </html>
