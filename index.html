@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SPIKE Prime Web Bluetooth – 3 Motors</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:16px;line-height:1.5}
+    .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:12px}
+    .card{border:1px solid #ddd;border-radius:12px;padding:12px}
+    button{padding:8px 12px;border-radius:8px;border:1px solid #ccc;background:#f7f7f7;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .muted{color:#666}
+    .port{font-weight:600}
+    input[type="range"]{width:100%}
+    .mini{font-size:.9em}
+    .ok{color:#0a7}
+    .bad{color:#b00}
+  </style>
+</head>
+<body>
+  <h2>التحكم بثلاثة محركات – SPIKE Prime عبر Web Bluetooth</h2>
+  <p class="muted mini">
+    يعمل على Chrome/Android عبر HTTPS. فعّل Bluetooth واسمح بأذونات "Nearby devices" و"Location" إذا طُلبت.
+  </p>
+
+  <button id="connectBtn">اتصال بالـHub</button>
+  <span id="status" class="muted">غير متصل</span>
+
+  <div class="row" id="motors">
+    <!-- تمتلئ تلقائيًا عند اكتشاف المحركات -->
+  </div>
+
+<script>
+(() => {
+  const LEGO_SERVICE = "00001623-1212-efde-1623-785feabcd123";
+  const LEGO_CHAR    = "00001624-1212-efde-1623-785feabcd123";
+
+  let device, server, characteristic;
+  let attachedMotors = []; // قائمة {portId, ioType}
+  let chosen = [];         // أول 3 محركات مكتشفة
+
+  const statusEl = document.getElementById("status");
+  const motorsEl = document.getElementById("motors");
+  const connectBtn = document.getElementById("connectBtn");
+
+  function setStatus(txt, ok=false){
+    statusEl.textContent = txt;
+    statusEl.className = ok ? "ok" : "bad";
+  }
+
+  connectBtn.onclick = async () => {
+    try{
+      connectBtn.disabled = true;
+      setStatus("جاري البحث عن الـHub...");
+      device = await navigator.bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: [LEGO_SERVICE]
+      });
+      device.addEventListener('gattserverdisconnected', () => {
+        setStatus("انقطع الاتصال", false);
+        connectBtn.disabled = false;
+      });
+
+      server = await device.gatt.connect();
+      const service = await server.getPrimaryService(LEGO_SERVICE);
+      characteristic = await service.getCharacteristic(LEGO_CHAR);
+
+      await characteristic.startNotifications();
+      characteristic.addEventListener('characteristicvaluechanged', handleNotification);
+
+      setStatus("متصل – بانتظار المنافذ المتصلة (Hub Attached I/O)...", true);
+      // بعد الاتصال، الـHub عادة يرسل 0x04 للمنافذ المتصلة تلقائيًا.
+    }catch(e){
+      console.error(e);
+      setStatus("فشل الاتصال: " + (e?.message || e), false);
+      connectBtn.disabled = false;
+    }
+  };
+
+  function handleNotification(ev){
+    const buf = new Uint8Array(ev.target.value.buffer);
+    // قد يأتي أكثر من إطار في إشعار واحد: نمشي بالـLength
+    let off = 0;
+    while (off < buf.length){
+      const len = buf[off];
+      if (!len || off + len > buf.length) break;
+      const msgType = buf[off + 2];
+
+      // Hub Attached I/O (0x04)
+      if (msgType === 0x04){
+        const portId = buf[off + 3];
+        const event  = buf[off + 4]; // 0x01 Attached, 0x02 Detached...
+        if (event === 0x01){
+          // IO Type (UInt16 LE) عند +5/+6
+          const ioType = buf[off + 5] | (buf[off + 6] << 8);
+          // أنواع المحركات الشائعة: 0x0001 (LPF2) ، 0x0026/0x0027 محركات تاخو
+          if ([0x0001, 0x0026, 0x0027].includes(ioType)){
+            if (!attachedMotors.find(m => m.portId === portId)) {
+              attachedMotors.push({portId, ioType});
+              autoFillThreeMotors();
+            }
+          }
+        }
+        if (event === 0x02){ // Detached
+          attachedMotors = attachedMotors.filter(m => m.portId !== portId);
+          chosen = chosen.filter(p => p !== portId);
+          renderMotorCards();
+        }
+      }
+      off += len;
+    }
+  }
+
+  function autoFillThreeMotors(){
+    // خذ أول 3 منافذ فيها محرك
+    chosen = attachedMotors.map(m => m.portId).slice(0,3);
+    renderMotorCards();
+    if (chosen.length){
+      setStatus(`تم اكتشاف محركات على المنافذ: ${chosen.join(", ")}`, true);
+    }
+  }
+
+  function renderMotorCards(){
+    motorsEl.innerHTML = "";
+    chosen.forEach((portId, idx) => {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML = `
+        <div>محرك ${idx+1} – <span class="port">Port ${portId}</span></div>
+        <label>السرعة (-100 إلى 100):</label>
+        <input type="range" min="-100" max="100" value="50" step="1" id="spd${idx}">
+        <div class="mini muted">StartSpeed = 0x81,0x07 | Coast/Brake = 0x81,0x51,Mode 0x00</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+          <button id="run${idx}">تشغيل</button>
+          <button id="rev${idx}">عكس</button>
+          <button id="coast${idx}">عَوْم (Coast)</button>
+          <button id="brake${idx}">فرامل (Brake)</button>
+        </div>
+      `;
+      motorsEl.appendChild(card);
+      document.getElementById(`run${idx}`).onclick   = () => sendStartSpeed(portId, getSlider(idx));
+      document.getElementById(`rev${idx}`).onclick   = () => sendStartSpeed(portId, -Math.abs(getSlider(idx)));
+      document.getElementById(`coast${idx}`).onclick = () => sendStartPowerCoast(portId);
+      document.getElementById(`brake${idx}`).onclick = () => sendStartPowerBrake(portId);
+    });
+  }
+
+  function getSlider(i){
+    return parseInt(document.getElementById(`spd${i}`).value, 10) || 0;
+  }
+
+  // === رسائل LWP3 مطابقة للوثائق ===
+  // StartSpeed [0x81, SubCmd 0x07] بطول 9 بايت
+  async function sendStartSpeed(portId, speedPercent, maxPower=100, useProfile=0){
+    if (!characteristic) return;
+    const s = Math.max(-100, Math.min(100, Math.round(speedPercent)));
+    // Length=9, HubId=0x00, MsgType=0x81, Startup/Completion=0x11
+    const bytes = new Uint8Array([
+      0x09, 0x00, 0x81, portId & 0xFF, 0x11, 0x07,
+      (s & 0xFF), (maxPower & 0xFF), (useProfile & 0xFF)
+    ]);
+    await characteristic.writeValue(bytes);
+  }
+
+  // WriteDirectModeData [0x81,0x51] Mode=0x00 (Power)
+  // Coast (Power=0) طول 8 بايت
+  async function sendStartPowerCoast(portId){
+    if (!characteristic) return;
+    const bytes = new Uint8Array([0x08,0x00,0x81, portId & 0xFF, 0x11, 0x51, 0x00, 0x00]);
+    await characteristic.writeValue(bytes);
+  }
+
+  // Brake (Power=127 / 0x7F) طول 8 بايت
+  async function sendStartPowerBrake(portId){
+    if (!characteristic) return;
+    const bytes = new Uint8Array([0x08,0x00,0x81, portId & 0xFF, 0x11, 0x51, 0x00, 0x7F]);
+    await characteristic.writeValue(bytes);
+  }
+})();
+</script>
+</body>
+</html>
